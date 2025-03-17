@@ -197,6 +197,15 @@ void func_tasklet_polling(unsigned long paramf){
     printk(KERN_INFO "tasklet_polling_func: irqEnCours (before tasklet processing) = %d\n", irq);  // Print irqEnCours before processing
 
     printk(KERN_INFO "tasklet_polling_func: irq courant = %d\n", irq);
+    printk(KERN_INFO "tasklet_polling_func: Mettre les broches lectures a 0\n");
+
+    for (colonne_lecture = 0; colonne_lecture < gpioLecture->ndescs; ++colonne_lecture)
+    {
+        if (colonne_lecture == irqId[colonne_lecture])
+        {
+            break;
+        }
+    }
 
     // (2) Balayage de toutes les lignes
     for (ligne_ecriture = 0; ligne_ecriture < gpioEcriture->ndescs; ++ligne_ecriture) {
@@ -216,30 +225,33 @@ void func_tasklet_polling(unsigned long paramf){
         }
         
         // (4) Détection de nouvelles touches pressées
-        for (colonne_lecture = 0; colonne_lecture < gpioLecture->ndescs; ++colonne_lecture) {
+        if(value_bitmap_lecture > 0)
+        {
             mask = (1 << colonne_lecture);
+            printk(KERN_ALERT "tasklet_polling_func : dernierEtat (%d)\n", dernierEtat[ligne_ecriture][colonne_lecture]);
+            
             if ((value_bitmap_lecture & mask) && !dernierEtat[ligne_ecriture][colonne_lecture]) {
-                // Une nouvelle touche a été pressée
-                printk(KERN_INFO "SETR_CLAVIER : Touche détectée ligne=%d, colonne=%d, bouton=%c\n", ligne_ecriture, colonne_lecture, valeursClavier[ligne_ecriture][colonne_lecture]);
-                // Ajouter la touche détectée dans le buffer de touches ici
-                dernierEtat[ligne_ecriture][colonne_lecture] = 1;
+                printk(KERN_INFO "SETR_CLAVIER : Touche détectée (Ligne %d, Colonne %d, Bouton %c)\n",
+                        ligne_ecriture, colonne_lecture, valeursClavier[ligne_ecriture][colonne_lecture]);
 
+                // (5) Mise à jour du buffer avec protection contre les race conditions
                 mutex_lock(&sync);
                 data[posCouranteEcriture] = valeursClavier[ligne_ecriture][colonne_lecture];
                 posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
                 mutex_unlock(&sync);
+
+                dernierEtat[ligne_ecriture][colonne_lecture] = 1;
             } else if (!(value_bitmap_lecture & mask)) {
-                // La touche a été relâchée
                 dernierEtat[ligne_ecriture][colonne_lecture] = 0;
-            }
+            }  
         }
 
-        // printk(KERN_CONT "\n");
+        printk(KERN_CONT "\n");
     }
 
     // (6) Réinitialisation des lignes pour réarmer l’interruption
-    // value_bitmap_ecriture = (1 << gpioEcriture->ndescs) - 1;
-    // ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
+    value_bitmap_ecriture = (1 << gpioEcriture->ndescs) - 1;
+    ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
     if (ret < 0) {
         printk(KERN_ALERT "SETR_CLAVIER : Erreur réinitialisation GPIO (%d)\n", ret);
     }
@@ -272,14 +284,14 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // On retourne en indiquant qu'on a géré l'interruption
     printk(KERN_INFO "setr_irq_handler: irqEnCours (before checking) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before checking
     
-    if (atomic_cmpxchg(&irqEnCours, 0, 1) != 0) {
-        printk(KERN_INFO "setr_irq_handler: IRQ %d ignored (tasklet already scheduled or running)\n", irq);
-        return (irqreturn_t) IRQ_HANDLED;
+    if (atomic_read(&irqEnCours) != 0) {
+        printk(KERN_INFO "setr_irq_handler: IRQ %d ignored (interrupt already in progress)\n", irq);
+        return (irqreturn_t) IRQ_HANDLED;  // Return that IRQ is handled but not processed
     }
 
     // Set the irqEnCours to indicate the current IRQ being handled
-    // printk(KERN_INFO "setr_irq_handler: irqEnCours (before setting) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before setting
-    // atomic_set(&irqEnCours, irq);
+    printk(KERN_INFO "setr_irq_handler: irqEnCours (before setting) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before setting
+    atomic_set(&irqEnCours, irq);
 
     // Log the received IRQ
     printk(KERN_INFO "setr_irq_handler: irqEnCours (after setting) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours after setting
@@ -460,76 +472,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // posCouranteLecture, et vous devez gérer ce cas sans perdre de caractères et en respectant les
     // autres conditions (par exemple, ne jamais copier plus que len caractères).
 
-    size_t read_count = 0;
-    size_t to_read = 0;
-    size_t available_data = 0;
-    int ret;
-    // posCouranteLecture = posCouranteEcriture;
-
-    // Lock the mutex to synchronize access to the buffer
-    mutex_lock(&sync);
-
-    // Debug: Print the positions
-    printk(KERN_INFO "dev_read: posCouranteLecture = %zu, posCouranteEcriture = %zu\n", posCouranteLecture, posCouranteEcriture);
-
-    // Calculate available data in the circular buffer
-    if (posCouranteEcriture >= posCouranteLecture) {
-        available_data = posCouranteEcriture - posCouranteLecture;
-    } else {
-        available_data = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
-    }
-
-    // Debug: Print available data
-    printk(KERN_INFO "dev_read: available_data = %zu\n", available_data);
-
-    // The number of bytes to copy is the minimum of available data and requested length
-    to_read = min(len, available_data);
-
-    // Debug: Print how many bytes we are going to read
-    printk(KERN_INFO "dev_read: to_read = %zu\n", to_read);
-
-    // Copy the data into the user buffer
-    while (read_count < to_read) {
-        size_t chunk_size;
-
-        // Calculate the chunk size to read (either the remainder or the full chunk)
-        if (posCouranteLecture + read_count >= TAILLE_BUFFER) {
-            chunk_size = TAILLE_BUFFER - posCouranteLecture - read_count;
-        } else {
-            chunk_size = to_read - read_count;
-        }
-
-        // Debug: Print chunk size and position
-        printk(KERN_INFO "dev_read: chunk_size = %zu, reading from pos = %zu\n", chunk_size, posCouranteLecture + read_count);
-
-        // Copy data from the buffer to the user space
-        ret = copy_to_user(buffer + read_count, &data[posCouranteLecture + read_count % TAILLE_BUFFER], chunk_size);
-        if (ret != 0) {
-            // Unlock mutex and return error if there was an issue copying data
-            mutex_unlock(&sync);
-            printk(KERN_ERR "dev_read: copy_to_user failed with error %d\n", ret);
-            return -EFAULT;
-        }
-
-        // Debug: Print how many bytes were successfully copied
-        printk(KERN_INFO "dev_read: copied %zu bytes to user buffer\n", chunk_size);
-
-        // Update read count
-        read_count += chunk_size;
-    }
-
-    // Update the read pointer (posCouranteLecture) after reading the data
-    posCouranteLecture = (posCouranteLecture + read_count) % TAILLE_BUFFER;
-
-    // Debug: Print updated read pointer
-    printk(KERN_INFO "dev_read: updated posCouranteLecture = %zu\n", posCouranteLecture);
-
-    // Unlock the mutex after reading
-    mutex_unlock(&sync);
-
-    // Return the number of bytes read
-    printk(KERN_INFO "dev_read: read %zu bytes\n", read_count);
-    return read_count;
+    return 0;
 }
 
 
