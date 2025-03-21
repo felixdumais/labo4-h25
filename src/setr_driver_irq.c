@@ -157,7 +157,6 @@ void func_tasklet_polling(unsigned long paramf){
     int ligne_ecriture, colonne_lecture;
     unsigned long value_bitmap_ecriture, value_bitmap_lecture, mask;
     int ret;
-    int irq = atomic_read(&irqEnCours);
     int i;
     int irq_state[NOMBRE_COLONNES]; // Tableau pour enregistrer l'état des IRQ
     value_bitmap_lecture = 0;
@@ -193,21 +192,10 @@ void func_tasklet_polling(unsigned long paramf){
     // cette fonction n'a pas à être exécutée en boucle, mais vous ne pouvez _pas_
     // faire un msleep ou une autre fonction similaire dans un tasklet!
 
-    // int ligne_ecriture, colonne_lecture;
-    // unsigned long value_bitmap_ecriture, value_bitmap_lecture, mask;
-    // int ret;
-
-
-    // Get the current IRQ number
-
     printk(KERN_INFO "tasklet_polling_func : Tasklet déclenché\n");
-    printk(KERN_INFO "tasklet_polling_func: irqEnCours (before tasklet processing) = %d\n", irq);  // Print irqEnCours before processing
-
-    printk(KERN_INFO "tasklet_polling_func: irq courant = %d\n", irq);
 
     for (i = 0; i < NOMBRE_COLONNES; ++i) {
         disable_irq_nosync(irqId[i]); // Utiliser disable_irq_nosync si possible
-        printk(KERN_DEBUG "tasklet_polling_func : IRQ %d désactivée (état=%d)\n", irqId[i]);
     }
     // (2) Balayage de toutes les lignes
     for (ligne_ecriture = 0; ligne_ecriture < gpioEcriture->ndescs; ++ligne_ecriture) {
@@ -225,36 +213,32 @@ void func_tasklet_polling(unsigned long paramf){
             printk(KERN_ALERT "tasklet_polling_func : Erreur lecture GPIO (%d)\n", ret);
             continue;
         }
-
-        printk(KERN_DEBUG "tasklet_polling_func : value_bitmap_lecture (%d)\n", value_bitmap_lecture);
         
-    //     // (4) Détection de nouvelles touches pressées
-    //     for (colonne_lecture = 0; colonne_lecture < gpioLecture->ndescs; ++colonne_lecture) {
-    //         mask = (1 << colonne_lecture);
-    //         if ((value_bitmap_lecture & mask) && !dernierEtat[ligne_ecriture][colonne_lecture]) {
-    //             // Une nouvelle touche a été pressée
-    //             printk(KERN_INFO "SETR_CLAVIER : Touche détectée ligne=%d, colonne=%d, bouton=%c\n", ligne_ecriture, colonne_lecture, valeursClavier[ligne_ecriture][colonne_lecture]);
-    //             // Ajouter la touche détectée dans le buffer de touches ici
-    //             dernierEtat[ligne_ecriture][colonne_lecture] = 1;
+        // (4) Détection de nouvelles touches pressées
+        for (colonne_lecture = 0; colonne_lecture < gpioLecture->ndescs; ++colonne_lecture) {
+            mask = (1 << colonne_lecture);
+            if ((value_bitmap_lecture & mask) && !dernierEtat[ligne_ecriture][colonne_lecture]) {
+                // Une nouvelle touche a été pressée
+                printk(KERN_INFO "SETR_CLAVIER : Touche détectée ligne=%d, colonne=%d, bouton=%c\n", ligne_ecriture, colonne_lecture, valeursClavier[ligne_ecriture][colonne_lecture]);
+                // Ajouter la touche détectée dans le buffer de touches ici
+                dernierEtat[ligne_ecriture][colonne_lecture] = 1;
 
-    //             mutex_lock(&sync);
-    //             data[posCouranteEcriture] = valeursClavier[ligne_ecriture][colonne_lecture];
-    //             posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
-    //             mutex_unlock(&sync);
-    //         } else if (!(value_bitmap_lecture & mask)) {
-    //             // La touche a été relâchée
-    //             dernierEtat[ligne_ecriture][colonne_lecture] = 0;
-    //         }
-    //     }
-
-    //     // printk(KERN_CONT "\n");
-    // }
+                mutex_lock(&sync);
+                data[posCouranteEcriture] = valeursClavier[ligne_ecriture][colonne_lecture];
+                posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
+                mutex_unlock(&sync);
+            } else if (!(value_bitmap_lecture & mask)) {
+                // La touche a été relâchée
+                dernierEtat[ligne_ecriture][colonne_lecture] = 0;
+            }
+        }
+    }
 
     // (6) Réinitialisation des lignes pour réarmer l’interruption
-    // value_bitmap_ecriture = (1 << gpioEcriture->ndescs) - 1;
-    // ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
-    // if (ret < 0) {
-    //     printk(KERN_ALERT "SETR_CLAVIER : Erreur réinitialisation GPIO (%d)\n", ret);
+    value_bitmap_ecriture = (1 << gpioEcriture->ndescs) - 1;
+    ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
+    if (ret < 0) {
+        printk(KERN_ALERT "SETR_CLAVIER : Erreur réinitialisation GPIO (%d)\n", ret);
     }
 
     for (i = 0; i < NOMBRE_COLONNES; ++i) {
@@ -264,6 +248,9 @@ void func_tasklet_polling(unsigned long paramf){
         }
     }
 
+    printk(KERN_INFO "tasklet_polling_func: irqEnCours (before reset) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before resetting
+    atomic_set(&irqEnCours, 0);  // Reset irqEnCours after processing the tasklet
+    printk(KERN_INFO "tasklet_polling_func: irqEnCours (after reset) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours after resetting
 
     printk(KERN_INFO "tasklet_polling_func: Processing complete\n");
 
@@ -305,20 +292,12 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
         return (irqreturn_t) IRQ_HANDLED;
     }
 
-    // Set the irqEnCours to indicate the current IRQ being handled
-    // printk(KERN_INFO "setr_irq_handler: irqEnCours (before setting) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before setting
-    // atomic_set(&irqEnCours, irq);
-
     // Log the received IRQ
     printk(KERN_INFO "setr_irq_handler: irqEnCours (after setting) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours after setting
     printk(KERN_INFO "setr_irq_handler: IRQ %d received\n", irq);
 
     // Schedule the tasklet for processing
     tasklet_schedule(&tasklet_polling);
-
-    printk(KERN_INFO "tasklet_polling_func: irqEnCours (before reset) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before resetting
-    atomic_set(&irqEnCours, 0);  // Reset irqEnCours after processing the tasklet
-    printk(KERN_INFO "tasklet_polling_func: irqEnCours (after reset) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours after resetting
 
     return (irqreturn_t) IRQ_HANDLED;
 }
