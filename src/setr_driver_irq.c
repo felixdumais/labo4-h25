@@ -252,10 +252,13 @@ void func_tasklet_polling(unsigned long paramf){
     //     printk(KERN_ALERT "SETR_CLAVIER : Erreur réinitialisation GPIO (%d)\n", ret);
     }
 
-    // for (i = 0; i < NOMBRE_COLONNES; ++i)
-    // {
-    //     enable_irq(irqId[i]);
-    // }
+    for (i = 0; i < NOMBRE_COLONNES; ++i) {
+        if (irq_state[i]) {
+            enable_irq(irqId[i]);
+            printk(KERN_DEBUG "tasklet_polling_func : IRQ %d réactivée\n", irqId[i]);
+        }
+    }
+
 
     printk(KERN_INFO "tasklet_polling_func: Processing complete\n");
 
