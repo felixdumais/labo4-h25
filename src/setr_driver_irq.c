@@ -34,6 +34,8 @@
 #include <linux/preempt.h>
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
+#include <linux/jiffies.h>
+#include <linux/timer.h>
 
 // Le nom de notre périphérique et le nom de sa classe
 #define DEV_NAME "setrclavier"
@@ -77,7 +79,6 @@ static struct device* setrDevice = NULL;    // Contiendra les informations sur l
 
 static struct mutex sync;                   // Mutex servant à synchroniser les accès au buffer
 static atomic_t irqEnCours = ATOMIC_INIT(0);  // Pour déterminer si les interruptions doivent être traitées
-
 
 // 4 GPIO doivent être assignés pour l'écriture, et 3 ou 4 en lecture (voir énoncé)
 // Nous vous proposons les choix suivants, mais ce n'est pas obligatoire
@@ -145,6 +146,10 @@ static int dernierEtat[NOMBRE_LIGNES][NOMBRE_COLONNES] = {0};
 static unsigned int irqId[NOMBRE_COLONNES];       
 // static unsigned int irqId_ecriture[NOMBRE_LIGNES];             
 
+static unsigned long last_interrupt_time = 0; // Temps de la dernière interruption
+
+#define DEBOUNCE_DELAY_MS 20 // Délai de débogage en millisecondes
+
 void func_tasklet_polling(unsigned long paramf){
     // TODO
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
@@ -202,7 +207,7 @@ void func_tasklet_polling(unsigned long paramf){
 
     for (i = 0; i < NOMBRE_COLONNES; ++i) {
         disable_irq_nosync(irqId[i]); // Utiliser disable_irq_nosync si possible
-        printk(KERN_DEBUG "tasklet_polling_func : IRQ %d désactivée (état=%d)\n", irqId[i], irq_state[i]);
+        printk(KERN_DEBUG "tasklet_polling_func : IRQ %d désactivée (état=%d)\n", irqId[i]);
     }
     // (2) Balayage de toutes les lignes
     for (ligne_ecriture = 0; ligne_ecriture < gpioEcriture->ndescs; ++ligne_ecriture) {
@@ -282,6 +287,17 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // TODO
 
     // On retourne en indiquant qu'on a géré l'interruption
+    unsigned long current_time = jiffies;
+    unsigned long time_diff = jiffies_to_msecs(current_time - last_interrupt_time);
+
+    // Vérifier si le délai de débogage est écoulé
+    if (time_diff < DEBOUNCE_DELAY_MS) {
+        printk(KERN_INFO "setr_irq_handler: IRQ %d ignorée (débogage)\n", irq);
+        return (irqreturn_t) IRQ_HANDLED;
+    }
+
+    last_interrupt_time = current_time;
+
     printk(KERN_INFO "setr_irq_handler: irqEnCours (before checking) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before checking
     
     if (atomic_cmpxchg(&irqEnCours, 0, 1) != 0) {
