@@ -201,7 +201,7 @@ void func_tasklet_polling(unsigned long paramf){
     printk(KERN_INFO "tasklet_polling_func: irq courant = %d\n", irq);
 
     for (i = 0; i < NOMBRE_COLONNES; ++i) {
-        irq_state[i] = disable_irq_nosync(irqId[i]); // Utiliser disable_irq_nosync si possible
+        disable_irq_nosync(irqId[i]); // Utiliser disable_irq_nosync si possible
         printk(KERN_DEBUG "tasklet_polling_func : IRQ %d désactivée (état=%d)\n", irqId[i], irq_state[i]);
     }
     // (2) Balayage de toutes les lignes
