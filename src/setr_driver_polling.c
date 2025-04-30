@@ -151,7 +151,10 @@ static int pollClavier(void *arg){
     // TODO
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
-    
+    int ligne_ecriture, colonne_lecture;
+    unsigned long value_bitmap_ecriture, value_bitmap_lecture, mask;
+    int ret;
+    value_bitmap_lecture = 0;
     
     printk(KERN_INFO "SETR_CLAVIER : Poll clavier declenche! \n");
     while(!kthread_should_stop()){           // Permet de s'arrêter en douceur lorsque kthread_stop() sera appelé
@@ -167,6 +170,41 @@ static int pollClavier(void *arg){
       // 3) Selon ces valeurs et le contenu de dernierEtat, détermine si une nouvelle touche a été pressée
       // 4) Met à jour le buffer et dernierEtat en s'assurant d'éviter les race conditions avec le reste du module
 
+      for (ligne_ecriture = 0; ligne_ecriture < gpioEcriture->ndescs; ++ligne_ecriture)
+      {
+        value_bitmap_ecriture = 0;
+        value_bitmap_ecriture |= (1 << ligne_ecriture);
+        ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
+        if (ret < 0) {
+            printk(KERN_ALERT "SETR_CLAVIER : Erreur lors de la configuration des lignes d'écriture (%d)\n", ret);
+            return ret; 
+        }
+
+        ret = gpiod_get_array_value(gpioLecture->ndescs, gpioLecture->desc, gpioLecture->info, &value_bitmap_lecture);
+        if (ret < 0) {
+            printk(KERN_ALERT "SETR_CLAVIER : Erreur lors de la lecture des lignes de lectures (%d)\n", ret);
+            return ret; 
+        }
+
+        for (colonne_lecture = 0; colonne_lecture < gpioLecture->ndescs; ++colonne_lecture) {
+            mask = (1 << colonne_lecture);
+            if ((value_bitmap_lecture & mask) && !dernierEtat[ligne_ecriture][colonne_lecture]) {
+                // Une nouvelle touche a été pressée
+                printk(KERN_INFO "SETR_CLAVIER : Touche détectée ligne=%d, colonne=%d, bouton=%c\n", ligne_ecriture, colonne_lecture, valeursClavier[ligne_ecriture][colonne_lecture]);
+                // Ajouter la touche détectée dans le buffer de touches ici
+                dernierEtat[ligne_ecriture][colonne_lecture] = 1;
+
+                mutex_lock(&sync);
+                data[posCouranteEcriture] = valeursClavier[ligne_ecriture][colonne_lecture];
+                posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
+                mutex_unlock(&sync);
+            } else if (!(value_bitmap_lecture & mask)) {
+                // La touche a été relâchée
+                dernierEtat[ligne_ecriture][colonne_lecture] = 0;
+            }
+        }
+      }
+
 
       set_current_state(TASK_INTERRUPTIBLE); // On indique qu'on peut être interrompu
       msleep(pausePollingMs);                // On se met en pause un certain temps
@@ -180,7 +218,7 @@ static int __init setrclavier_init(void){
     // TODO
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
-    
+
     printk(KERN_INFO "SETR_CLAVIER : Initialisation du driver commencee\n");
 
     // On enregistre notre pilote
@@ -221,7 +259,26 @@ static int __init setrclavier_init(void){
     //
     // Vous devez également initialiser le mutex de synchronisation.
 
+    gpiod_add_lookup_table(&gpios_table);
+    printk("GPIO lookup table added\n");
 
+    gpioLecture = gpiod_get_array(setrDevice, "lecture", GPIOD_IN);
+    if (IS_ERR(gpioLecture)) {
+        printk("Erreur lors de l'acquisition des GPIO de lecture\n");
+        return PTR_ERR(gpioLecture);
+    }
+
+    /* Récupérer les GPIO pour l'écriture */
+    gpioEcriture = gpiod_get_array(setrDevice, "ecriture", GPIOD_OUT_LOW);
+    if (IS_ERR(gpioEcriture)) {
+        printk("Erreur lors de l'acquisition des GPIO d'écriture\n");
+        gpiod_put_array(gpioLecture);
+        return PTR_ERR(gpioEcriture);
+    }
+
+    printk("GPIO Lecture et Ecriture initialisés avec succès\n");
+
+    mutex_init(&sync);
 
     // Le mutex devrait avoir été initialisé avant d'appeler la ligne suivante!
     task = kthread_run(pollClavier, NULL, "Thread_polling_clavier");
@@ -244,6 +301,14 @@ static void __exit setrclavier_exit(void){
     // Écrivez le code permettant de relâcher (libérer) les GPIO
     // N'oubliez pas également de retirer la table de correspondances avec
     // gpiod_remove_lookup_table
+
+    gpiod_remove_lookup_table(&gpios_table);
+    printk("GPIO lookup table removed\n");
+
+    gpiod_put_array(gpioLecture);
+    gpiod_put_array(gpioEcriture);
+    mutex_destroy(&sync);
+
 
     // On retire correctement les différentes composantes du pilote
     device_destroy(setrClasse, MKDEV(majorNumber, 0));
@@ -284,6 +349,76 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // posCouranteLecture, et vous devez gérer ce cas sans perdre de caractères et en respectant les
     // autres conditions (par exemple, ne jamais copier plus que len caractères).
 
+    size_t read_count = 0;
+    size_t to_read = 0;
+    size_t available_data = 0;
+    int ret;
+    // posCouranteLecture = posCouranteEcriture;
+
+    // Lock the mutex to synchronize access to the buffer
+    mutex_lock(&sync);
+
+    // Debug: Print the positions
+    printk(KERN_INFO "dev_read: posCouranteLecture = %zu, posCouranteEcriture = %zu\n", posCouranteLecture, posCouranteEcriture);
+
+    // Calculate available data in the circular buffer
+    if (posCouranteEcriture >= posCouranteLecture) {
+        available_data = posCouranteEcriture - posCouranteLecture;
+    } else {
+        available_data = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
+    }
+
+    // Debug: Print available data
+    printk(KERN_INFO "dev_read: available_data = %zu\n", available_data);
+
+    // The number of bytes to copy is the minimum of available data and requested length
+    to_read = min(len, available_data);
+
+    // Debug: Print how many bytes we are going to read
+    printk(KERN_INFO "dev_read: to_read = %zu\n", to_read);
+
+    // Copy the data into the user buffer
+    while (read_count < to_read) {
+        size_t chunk_size;
+
+        // Calculate the chunk size to read (either the remainder or the full chunk)
+        if (posCouranteLecture + read_count >= TAILLE_BUFFER) {
+            chunk_size = TAILLE_BUFFER - posCouranteLecture - read_count;
+        } else {
+            chunk_size = to_read - read_count;
+        }
+
+        // Debug: Print chunk size and position
+        printk(KERN_INFO "dev_read: chunk_size = %zu, reading from pos = %zu\n", chunk_size, posCouranteLecture + read_count);
+
+        // Copy data from the buffer to the user space
+        ret = copy_to_user(buffer + read_count, &data[posCouranteLecture + read_count % TAILLE_BUFFER], chunk_size);
+        if (ret != 0) {
+            // Unlock mutex and return error if there was an issue copying data
+            mutex_unlock(&sync);
+            printk(KERN_ERR "dev_read: copy_to_user failed with error %d\n", ret);
+            return -EFAULT;
+        }
+
+        // Debug: Print how many bytes were successfully copied
+        printk(KERN_INFO "dev_read: copied %zu bytes to user buffer\n", chunk_size);
+
+        // Update read count
+        read_count += chunk_size;
+    }
+
+    // Update the read pointer (posCouranteLecture) after reading the data
+    posCouranteLecture = (posCouranteLecture + read_count) % TAILLE_BUFFER;
+
+    // Debug: Print updated read pointer
+    printk(KERN_INFO "dev_read: updated posCouranteLecture = %zu\n", posCouranteLecture);
+
+    // Unlock the mutex after reading
+    mutex_unlock(&sync);
+
+    // Return the number of bytes read
+    printk(KERN_INFO "dev_read: read %zu bytes\n", read_count);
+    return read_count;
 }
 
 // On enregistre les fonctions d'initialisation et de destruction

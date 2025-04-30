@@ -31,6 +31,11 @@
 #include <linux/mutex.h>            // Mutex et synchronisation
 #include <linux/interrupt.h>        // Définit les symboles pour les interruptions et les tasklets
 #include <linux/atomic.h>           // Synchronisation par valeur atomique
+#include <linux/preempt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
+#include <linux/jiffies.h>
+#include <linux/timer.h>
 
 // Le nom de notre périphérique et le nom de sa classe
 #define DEV_NAME "setrclavier"
@@ -74,7 +79,6 @@ static struct device* setrDevice = NULL;    // Contiendra les informations sur l
 
 static struct mutex sync;                   // Mutex servant à synchroniser les accès au buffer
 static atomic_t irqEnCours = ATOMIC_INIT(0);  // Pour déterminer si les interruptions doivent être traitées
-
 
 // 4 GPIO doivent être assignés pour l'écriture, et 3 ou 4 en lecture (voir énoncé)
 // Nous vous proposons les choix suivants, mais ce n'est pas obligatoire
@@ -139,15 +143,25 @@ static struct gpio_descs *gpioLecture, *gpioEcriture;
 static int dernierEtat[NOMBRE_LIGNES][NOMBRE_COLONNES] = {0};
 
 // Contient les numéros d'interruption pour chaque broche de lecture
-static unsigned int irqId[NOMBRE_COLONNES];               
+static unsigned int irqId[NOMBRE_COLONNES];       
+// static unsigned int irqId_ecriture[NOMBRE_LIGNES];             
 
+static unsigned long last_interrupt_time = 0; // Temps de la dernière interruption
 
+#define DEBOUNCE_DELAY_MS 20 // Délai de débogage en millisecondes
 
 void func_tasklet_polling(unsigned long paramf){
     // TODO
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
-    
+    int ligne_ecriture, colonne_lecture;
+    unsigned long value_bitmap_ecriture, value_bitmap_lecture, mask;
+    int ret;
+    int i;
+    int irq_state[NOMBRE_COLONNES]; // Tableau pour enregistrer l'état des IRQ
+    value_bitmap_lecture = 0;
+    value_bitmap_ecriture = 0;
+
     // Cette fonction est le coeur d'exécution du tasklet
     // Elle fait à peu de choses près la même chose que le kthread
     // dans le pilote que vous avez précédemment écrit (par polling),
@@ -178,6 +192,68 @@ void func_tasklet_polling(unsigned long paramf){
     // cette fonction n'a pas à être exécutée en boucle, mais vous ne pouvez _pas_
     // faire un msleep ou une autre fonction similaire dans un tasklet!
 
+    printk(KERN_INFO "tasklet_polling_func : Tasklet déclenché\n");
+
+    for (i = 0; i < NOMBRE_COLONNES; ++i) {
+        disable_irq_nosync(irqId[i]); // Utiliser disable_irq_nosync si possible
+    }
+    // (2) Balayage de toutes les lignes
+    for (ligne_ecriture = 0; ligne_ecriture < gpioEcriture->ndescs; ++ligne_ecriture) {
+        value_bitmap_ecriture = 1 << ligne_ecriture;
+
+        ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
+        if (ret < 0) {
+            printk(KERN_ALERT "tasklet_polling_func : Erreur écriture GPIO (%d)\n", ret);
+            continue;
+        }
+
+        // (3) Lecture des colonnes après avoir activé une ligne
+        ret = gpiod_get_array_value(gpioLecture->ndescs, gpioLecture->desc, gpioLecture->info, &value_bitmap_lecture);
+        if (ret < 0) {
+            printk(KERN_ALERT "tasklet_polling_func : Erreur lecture GPIO (%d)\n", ret);
+            continue;
+        }
+        
+        // (4) Détection de nouvelles touches pressées
+        for (colonne_lecture = 0; colonne_lecture < gpioLecture->ndescs; ++colonne_lecture) {
+            mask = (1 << colonne_lecture);
+            if ((value_bitmap_lecture & mask) && !dernierEtat[ligne_ecriture][colonne_lecture]) {
+                // Une nouvelle touche a été pressée
+                printk(KERN_INFO "SETR_CLAVIER : Touche détectée ligne=%d, colonne=%d, bouton=%c\n", ligne_ecriture, colonne_lecture, valeursClavier[ligne_ecriture][colonne_lecture]);
+                // Ajouter la touche détectée dans le buffer de touches ici
+                dernierEtat[ligne_ecriture][colonne_lecture] = 1;
+
+                mutex_lock(&sync);
+                data[posCouranteEcriture] = valeursClavier[ligne_ecriture][colonne_lecture];
+                posCouranteEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
+                mutex_unlock(&sync);
+            } else if (!(value_bitmap_lecture & mask)) {
+                // La touche a été relâchée
+                dernierEtat[ligne_ecriture][colonne_lecture] = 0;
+            }
+        }
+    }
+
+    // (6) Réinitialisation des lignes pour réarmer l’interruption
+    value_bitmap_ecriture = (1 << gpioEcriture->ndescs) - 1;
+    ret = gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &value_bitmap_ecriture);
+    if (ret < 0) {
+        printk(KERN_ALERT "SETR_CLAVIER : Erreur réinitialisation GPIO (%d)\n", ret);
+    }
+
+    for (i = 0; i < NOMBRE_COLONNES; ++i) {
+        if (irq_state[i]) {
+            enable_irq(irqId[i]);
+            printk(KERN_DEBUG "tasklet_polling_func : IRQ %d réactivée\n", irqId[i]);
+        }
+    }
+
+    printk(KERN_INFO "tasklet_polling_func: irqEnCours (before reset) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before resetting
+    atomic_set(&irqEnCours, 0);  // Reset irqEnCours after processing the tasklet
+    printk(KERN_INFO "tasklet_polling_func: irqEnCours (after reset) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours after resetting
+
+    printk(KERN_INFO "tasklet_polling_func: Processing complete\n");
+
 }
 
 // On déclare le tasklet avec la macro DECLARE_TASKLET_OLD
@@ -198,6 +274,31 @@ static irqreturn_t  setr_irq_handler(unsigned int irq, void *dev_id){
     // TODO
 
     // On retourne en indiquant qu'on a géré l'interruption
+    unsigned long current_time = jiffies;
+    unsigned long time_diff = jiffies_to_msecs(current_time - last_interrupt_time);
+
+    // Vérifier si le délai de débogage est écoulé
+    if (time_diff < DEBOUNCE_DELAY_MS) {
+        printk(KERN_INFO "setr_irq_handler: IRQ %d ignorée (débogage)\n", irq);
+        return (irqreturn_t) IRQ_HANDLED;
+    }
+
+    last_interrupt_time = current_time;
+
+    printk(KERN_INFO "setr_irq_handler: irqEnCours (before checking) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours before checking
+    
+    if (atomic_cmpxchg(&irqEnCours, 0, 1) != 0) {
+        printk(KERN_INFO "setr_irq_handler: IRQ %d ignored (tasklet already scheduled or running)\n", irq);
+        return (irqreturn_t) IRQ_HANDLED;
+    }
+
+    // Log the received IRQ
+    printk(KERN_INFO "setr_irq_handler: irqEnCours (after setting) = %d\n", atomic_read(&irqEnCours));  // Print irqEnCours after setting
+    printk(KERN_INFO "setr_irq_handler: IRQ %d received\n", irq);
+
+    // Schedule the tasklet for processing
+    tasklet_schedule(&tasklet_polling);
+
     return (irqreturn_t) IRQ_HANDLED;
 }
 
@@ -207,6 +308,8 @@ static int __init setrclavier_init(void){
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
     int ok;
+    int ligne_lecture;
+    int irqno;
     printk(KERN_INFO "SETR_CLAVIER_IRQ : Initialisation du driver commencee\n");
 
     majorNumber = register_chrdev(0, DEV_NAME, &fops);
@@ -254,19 +357,46 @@ static int __init setrclavier_init(void){
     //
     // Vous devez également initialiser le mutex de synchronisation.
 
-    ok = request_irq(irqno,                 // Le numéro de l'interruption, obtenue avec gpio_to_irq
-         (irq_handler_t) setr_irq_handler,  // Pointeur vers la routine de traitement de l'interruption
-         IRQF_TRIGGER_RISING,               // On veut une interruption sur le front montant (lorsque le bouton est pressé)
-         "setr_irq_handler",                // Le nom de notre interruption
-         NULL);                             // Paramètre supplémentaire inutile pour vous
-    if(ok != 0){
-        printk(KERN_ALERT "Erreur (%d) lors de l'enregistrement IRQ #{%d}!\n", ok, irqno);
-        device_destroy(setrClasse, MKDEV(majorNumber, 0));
-        class_destroy(setrClasse);
-        unregister_chrdev(majorNumber, DEV_NAME);
-        return ok;
+
+    gpiod_add_lookup_table(&gpios_table);
+    printk("GPIO lookup table added\n");
+
+    gpioLecture = gpiod_get_array(setrDevice, "lecture", GPIOD_IN);
+    if (IS_ERR(gpioLecture)) {
+        printk("Erreur lors de l'acquisition des GPIO de lecture\n");
+        return PTR_ERR(gpioLecture);
     }
 
+    /* Récupérer les GPIO pour l'écriture */
+    gpioEcriture = gpiod_get_array(setrDevice, "ecriture", GPIOD_OUT_LOW);
+    if (IS_ERR(gpioEcriture)) {
+        printk("Erreur lors de l'acquisition des GPIO d'écriture\n");
+        gpiod_put_array(gpioLecture);
+        return PTR_ERR(gpioEcriture);
+    }
+
+    printk("GPIO Lecture et Ecriture initialisés avec succès\n");
+
+    mutex_init(&sync);
+
+
+    for (ligne_lecture = 0; ligne_lecture < gpioLecture->ndescs; ++ligne_lecture)
+    {
+        irqno = gpiod_to_irq(gpioLecture->desc[ligne_lecture]);
+        irqId[ligne_lecture] = irqno;
+        ok = request_irq(irqno,                 // Le numéro de l'interruption, obtenue avec gpio_to_irq
+            (irq_handler_t) setr_irq_handler,  // Pointeur vers la routine de traitement de l'interruption
+            IRQF_TRIGGER_RISING,               // On veut une interruption sur le front montant (lorsque le bouton est pressé)
+            "setr_irq_handler",                // Le nom de notre interruption
+            NULL);                             // Paramètre supplémentaire inutile pour vous
+        if(ok != 0){
+            printk(KERN_ALERT "Erreur (%d) lors de l'enregistrement IRQ #{%d}!\n", ok, irqno);
+            device_destroy(setrClasse, MKDEV(majorNumber, 0));
+            class_destroy(setrClasse);
+            unregister_chrdev(majorNumber, DEV_NAME);
+            return ok;
+        }
+    }
 
     printk(KERN_INFO "SETR_CLAVIER_IRQ : Fin de l'Initialisation!\n"); // Made it! device was initialized
 
@@ -278,14 +408,24 @@ static void __exit setrclavier_exit(void){
     // TODO
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
-
+    int ligne_lecture;
     // TODO
     // Écrivez le code permettant de relâcher (libérer) les GPIO
     // 1) Relâchez les interruptions qui ont été précédemment enregistrées. 
     //      Utilisez free_irq(irqno, NULL) pour chaque GPIO
     // 2) Libérez les GPIO obtenus dans l'initialisation
     // 3) Retirez la table de correspondances avec gpiod_remove_lookup_table
+    for (ligne_lecture = 0; ligne_lecture < gpioLecture->ndescs; ++ligne_lecture)
+    {
+        free_irq(irqId[ligne_lecture], NULL);
+    }
 
+    gpiod_remove_lookup_table(&gpios_table);
+    printk("GPIO lookup table removed\n");
+
+    gpiod_put_array(gpioLecture);
+    gpiod_put_array(gpioEcriture);
+    mutex_destroy(&sync);
 
     // On retire correctement les différentes composantes du pilote
     device_destroy(setrClasse, MKDEV(majorNumber, 0));
@@ -330,6 +470,77 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // revienne alors à 0. Il est donc tout à fait possible que posCouranteEcriture soit INFÉRIEUR à
     // posCouranteLecture, et vous devez gérer ce cas sans perdre de caractères et en respectant les
     // autres conditions (par exemple, ne jamais copier plus que len caractères).
+
+    size_t read_count = 0;
+    size_t to_read = 0;
+    size_t available_data = 0;
+    int ret;
+    // posCouranteLecture = posCouranteEcriture;
+
+    // Lock the mutex to synchronize access to the buffer
+    mutex_lock(&sync);
+
+    // Debug: Print the positions
+    printk(KERN_INFO "dev_read: posCouranteLecture = %zu, posCouranteEcriture = %zu\n", posCouranteLecture, posCouranteEcriture);
+
+    // Calculate available data in the circular buffer
+    if (posCouranteEcriture >= posCouranteLecture) {
+        available_data = posCouranteEcriture - posCouranteLecture;
+    } else {
+        available_data = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
+    }
+
+    // Debug: Print available data
+    printk(KERN_INFO "dev_read: available_data = %zu\n", available_data);
+
+    // The number of bytes to copy is the minimum of available data and requested length
+    to_read = min(len, available_data);
+
+    // Debug: Print how many bytes we are going to read
+    printk(KERN_INFO "dev_read: to_read = %zu\n", to_read);
+
+    // Copy the data into the user buffer
+    while (read_count < to_read) {
+        size_t chunk_size;
+
+        // Calculate the chunk size to read (either the remainder or the full chunk)
+        if (posCouranteLecture + read_count >= TAILLE_BUFFER) {
+            chunk_size = TAILLE_BUFFER - posCouranteLecture - read_count;
+        } else {
+            chunk_size = to_read - read_count;
+        }
+
+        // Debug: Print chunk size and position
+        printk(KERN_INFO "dev_read: chunk_size = %zu, reading from pos = %zu\n", chunk_size, posCouranteLecture + read_count);
+
+        // Copy data from the buffer to the user space
+        ret = copy_to_user(buffer + read_count, &data[posCouranteLecture + read_count % TAILLE_BUFFER], chunk_size);
+        if (ret != 0) {
+            // Unlock mutex and return error if there was an issue copying data
+            mutex_unlock(&sync);
+            printk(KERN_ERR "dev_read: copy_to_user failed with error %d\n", ret);
+            return -EFAULT;
+        }
+
+        // Debug: Print how many bytes were successfully copied
+        printk(KERN_INFO "dev_read: copied %zu bytes to user buffer\n", chunk_size);
+
+        // Update read count
+        read_count += chunk_size;
+    }
+
+    // Update the read pointer (posCouranteLecture) after reading the data
+    posCouranteLecture = (posCouranteLecture + read_count) % TAILLE_BUFFER;
+
+    // Debug: Print updated read pointer
+    printk(KERN_INFO "dev_read: updated posCouranteLecture = %zu\n", posCouranteLecture);
+
+    // Unlock the mutex after reading
+    mutex_unlock(&sync);
+
+    // Return the number of bytes read
+    printk(KERN_INFO "dev_read: read %zu bytes\n", read_count);
+    return read_count;
 }
 
 
